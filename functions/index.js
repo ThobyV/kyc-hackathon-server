@@ -31,8 +31,8 @@ const sendCustomVerificationEmail = (email, displayName, link) => {
         port: 465,
         secure: true,
         auth: {
-            user: 'vivee18@gmail.com',
-            pass: 'qufgalxwfthwzdzh',
+            user: process.env.GMAIL_USER,
+            pass: process.env.GMAIL_PASS,
         }
     };
     var mailOptions = {
@@ -45,8 +45,30 @@ const sendCustomVerificationEmail = (email, displayName, link) => {
     var transporter = nodemailer.createTransport(config);
     transporter.sendMail(mailOptions, (error, response) => {
         if (error) { console.log(error); }
-        else { console.log("Message sent: " + response.message); }
+        else { console.log("Message sent"); }
     });
+}
+
+const checkToken = async (req, res, next) => {
+    const token = req.headers.authorization;
+    console.log(token);
+    if (!token) return res.status(401).send({ error: 'token not found' });
+    try {
+        let userRecord = await auth.verifyIdToken(token);
+        req.isSuperAdmin = userRecord.isSuperAdmin;
+        next();
+    } catch (error) {
+        console.log(error);
+        return res.status(403).send(error);
+    }
+}
+
+const checkAdmin = (req, res, next) => {
+    //role codes are a secret key: 
+    //34yvuc is the custom code for admin term: global admin
+    if (req.isSuperAdmin) {
+        next();
+    }
 }
 
 exports.createUser = functions.auth.user().onCreate(async (user) => {
@@ -57,12 +79,12 @@ exports.createUser = functions.auth.user().onCreate(async (user) => {
         return await sendCustomVerificationEmail(email, displayName, link);
     } catch (error) {
         console.log(error);
+        return
     }
 })
 
 app.post('/signup', async (req, res) => {
     try {
-        console.log('function signup')
         const {
             firstName,
             lastName,
@@ -71,73 +93,101 @@ app.post('/signup', async (req, res) => {
             password,
         } = req.body;
 
-        let hashedPassword = bcrypt.hashSync(password, 8);
+        let hashedPassword = await bcrypt.hash(password, 8);
 
-        let userRecord = await auth.createUser({
+        let { uid } = await auth.createUser({
             email: email,
             emailVerified: false,
             password: hashedPassword,
             displayName: `${firstName} ${lastName} `,
         })
 
-        let token = await auth.createCustomToken(userRecord.uid);
-
-        let userDoc = await db.collection('users').doc(userRecord.uid).set({
+        let userDoc = await db.collection('users').doc(uid).set({
             firstName,
             lastName,
             userName,
             email,
             hashedPassword,
         });
-        return res.status(200).send({ token, userRecord });
+
+        if (email === "cpuinformers@gmail.com") {
+            await admin.auth().setCustomUserClaims(uid, { isSuperAdmin: true })
+        }
+        let token = await auth.createCustomToken(uid);
+        return res.status(200).send(token);
     } catch (error) {
         console.log(error)
-        res.status(500).json({ error });
+        res.status(500).send(error);
     }
 });
 
 
 app.post('/signin', async (req, res) => {
     try {
-        let { email, password } = req.body;
-
-        let userAccount = await db.collection('users').where('email', '==', email).get();
-        if (userAccount.empty) { throw 'account does not exist'; }
-        let { _email, _password } = userAccount.docs[0].data();
-        let passwordMatch = bcrypt.compareSync(password, _password);
+        //we use user doc here instead of admin getUserByEmail to save us stress of accessing 
+        //firebase based passwords from here
+        let userDoc = await db.collection('users').where('email', '==', req.body.email).get();
+        if (userDoc.empty) { throw 'account does not exist'; }
+        let { hashedPassword } = userDoc.docs[0].data();
+        let passwordMatch = await bcrypt.compare(req.body.password, `${hashedPassword}`);
         if (!passwordMatch) throw 'passwords do not match';
-        let token = await auth.createCustomToken(userAccount.id);
-        return res.status(200).send({ token, userAccount });
+        let token = await auth.createCustomToken(userDoc.docs[0].id);
+        return res.status(200).send(token);
     } catch (error) {
         console.log(error)
-        res.status(500).json({ error });
+        return res.status(500).send(error);
     }
 });
 
-app.post('/verifybvn', async (req, res) => {
+app.get('/profile/:uid', checkToken, async (req, res) => {
+    try {
+        let userDoc = await db.collection('users').doc(req.params.uid).get();
+        if (!userDoc.exists) { throw 'account does not exist'; }
+        let { firstName, lastName, userName, BVN, passport } = userDoc.data()
+        return res.status(200).send({ firstName, lastName, userName, BVN, passport });
+    } catch (error) {
+        console.log(error)
+        return res.status(500).send(error);
+    }
+});
+
+app.post('/verifybvn', checkToken, checkAdmin, async (req, res) => {
     try {
         let bvnData = {
-            bvnId: '23553332',
-            dateOfBirth: '4/07/1995',
-            phoneNumber: '09023685797'
+            bvnId: '235',
+            dateOfBirth: '04/07/1995',
+            phoneNumber: '+2349023685797'
         }
 
         let { bankVerificationId, dateOfBirth } = req.body;
 
-        if (bankVerificationId === bvnData.bnvId && dateOfBirth === bvnData.dateOfBirth) {
-            console.log('congrats bvn matches')
-            //send otp
-            // update bvn data
-            let verifiedData = { verfied: true, bankVerificationId, dateOfBirth };
-            res.status(200).send(verifiedData);
+        if ((bankVerificationId === bvnData.bvnId) && (dateOfBirth === bvnData.dateOfBirth)) {
+            let verifiedData = {
+                valid: true, phoneNumber: bvnData.phoneNumber, dob: bvnData.dateOfBirth
+            };
+            return res.status(200).send(verifiedData);
         } else {
-            throw 'your bnv does not match'
+            console.log(req.body.bvnData);
+            throw 'your bvn has data does not match'
         }
-
-        return res.status(200).send(customToken);
     } catch (error) {
         console.log(error)
+        return res.status(500).send(error);
+    }
+});
 
-        res.status(500).json({ error });
+
+app.post('/updatebvn', checkToken, checkAdmin, async (req, res) => {
+    try {
+        const { uid, bvnData } = req.body;
+
+        await db.collection('users').doc(uid).set({
+            ...bvnData
+        }, { merge: true });
+
+        return res.status(200).send(bvnData);
+    } catch (error) {
+        console.log(error)
+        return res.status(500).send(error);
     }
 });
